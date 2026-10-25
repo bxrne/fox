@@ -38,6 +38,28 @@ def post_note():
 
 `fox.track(jsonify, http)` says that calling `jsonify` performs `http`. Calling another `@fox` function performs the effects that function names. A pure function that reaches HTTP fails at the definition.
 
+For an effect that tests need to replace, write a generator and yield an explicit request:
+
+```python
+from collections.abc import Generator
+from pathlib import Path
+from typing import Any
+
+from fox import EffectCall, fox
+
+@fox(effects="io")
+def read_note(path: str) -> Generator[EffectCall, Any, str]:
+    return (yield fox.perform("io", Path(path).read_text))
+```
+
+Normal calls drive the generator and invoke each request. Tests can intercept requests with
+`fox.intercept("io", handler)`, or pass `handlers={"io": handler}` to `fox.check` to generate
+calls without touching the real world. The handler receives an `EffectCall` containing the
+effect name, callable, positional arguments, and keyword arguments. `fox.check` refuses an
+effectful function without handlers. Interception and contract checks are disabled by
+`python -O`; the decorator exposes the generator's final return type, and production still
+drives yielded requests against their real callables.
+
 ## Move a project
 
 1. Decorate the pure functions. `requires` and `ensures` replace the example tables. Delete those unit tests.
@@ -53,7 +75,8 @@ uv run --group examples python examples/notes.py
 
 `PreconditionError` is a bad caller. `PostconditionError` is a bad body. `EffectError` is an effect the function did not name.
 
-Ship with the checks compiled out. Pure functions stay memoised.
+Ship with the checks compiled out. Pure, non-generator functions stay memoised; generator
+functions are always executed and are never memoised.
 
 ```bash
 python -O -m yourapp
