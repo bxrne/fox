@@ -7,7 +7,9 @@ build. ``python -O`` compiles the checks out and leaves the memo table.
 from __future__ import annotations
 
 import functools
-from collections.abc import Callable, Iterable
+import inspect
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from typing import Any, TypeVar, cast, overload
 
@@ -25,7 +27,7 @@ from fox.contract import (
     performed,
     predicates,
 )
-from fox.effects import PURE, Between, Effect, effect
+from fox.effects import PURE, Between, Effect, EffectCall, effect
 from fox.errors import EffectError, FailedClaim, PostconditionError, PreconditionError
 from fox.trace import effects_used, reject_unnamed, tracked
 
@@ -33,6 +35,9 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 _stack: ContextVar[tuple[Spec, ...]] = ContextVar("fox_stack", default=())
+_handlers: ContextVar[dict[Effect, Callable[[EffectCall], Any]]] = ContextVar(
+    "fox_handlers", default={}
+)
 pure_functions: list[Contracted[Any, Any]] = []
 
 
@@ -70,6 +75,38 @@ def _call(
     return runner(*args, **kwargs)
 
 
+def _dispatch(request: EffectCall, *, checked: bool) -> Any:
+    if checked:
+        for active in _stack.get():
+            reject_unnamed(performed(active), {request.effect})
+        handler = _handlers.get().get(request.effect)
+        if handler is not None:
+            return handler(request)
+    return request.function(*request.args, **request.kwargs)
+
+
+def _drive(value: Any, *, checked: bool) -> Any:
+    if not inspect.isgenerator(value):
+        return value
+
+    generator = value
+    try:
+        request = next(generator)
+        while True:
+            if not isinstance(request, EffectCall):
+                raise TypeError("@fox generators must yield fox.perform(...) requests")
+            try:
+                result = _dispatch(request, checked=checked)
+            except BaseException as error:
+                request = generator.throw(error)
+            else:
+                request = generator.send(result)
+    except StopIteration as finished:
+        return finished.value
+    finally:
+        generator.close()
+
+
 def _checked(
     target: Callable[P, R],
     runner: Callable[P, R],
@@ -92,7 +129,7 @@ def _checked(
 
         token: Token[tuple[Spec, ...]] = _stack.set((*parent, spec))
         try:
-            result = _call(runner, target, args, kwargs)
+            result = _drive(_call(runner, target, args, kwargs), checked=True)
         finally:
             _stack.reset(token)
 
