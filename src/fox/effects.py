@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -16,6 +18,8 @@ class Effect:
     name: str
 
     def __post_init__(self) -> None:
+        if not isinstance(self.name, str):
+            raise TypeError("effect name must be a string")
         if self.name == "" or any(character.isspace() for character in self.name):
             raise ValueError("effect name must be a non-empty token")
 
@@ -27,6 +31,16 @@ def effect(name: str) -> Effect:
     """
 
     return Effect(name)
+
+
+@dataclass(frozen=True)
+class EffectCall:
+    """A request yielded by a ``@fox`` generator for the runtime to handle."""
+
+    effect: Effect
+    function: Callable[..., Any]
+    args: tuple[Any, ...]
+    kwargs: dict[str, Any]
 
 
 class Between:
