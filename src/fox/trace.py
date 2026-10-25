@@ -9,12 +9,13 @@ import textwrap
 from collections.abc import Callable
 from types import FunctionType
 from typing import Any
+from weakref import WeakKeyDictionary
 
 from fox.contract import Spec, performed
 from fox.effects import Effect
 from fox.errors import EffectError
 
-tracked: dict[int, set[Effect]] = {}
+tracked: WeakKeyDictionary[Callable[..., Any], set[Effect]] = WeakKeyDictionary()
 
 
 def function_source(func: FunctionType) -> str:
@@ -97,7 +98,7 @@ def effects_used(func: Callable[..., Any]) -> set[Effect]:
         callee = lookup(func, name)
         if callee is None:
             continue
-        used.update(tracked.get(id(callee), ()))
+        used.update(tracked.get(callee, ()))
         callee_spec = getattr(callee, "__fox__", None)
         if isinstance(callee_spec, Spec):
             used.update(performed(callee_spec))
