@@ -5,49 +5,43 @@ from __future__ import annotations
 import ast
 import builtins
 import inspect
+import linecache
 import textwrap
 from collections.abc import Callable
+from contextlib import suppress
 from types import FunctionType
 from typing import Any
+from weakref import WeakKeyDictionary
 
 from fox.contract import Spec, performed
 from fox.effects import Effect
 from fox.errors import EffectError
 
-tracked: dict[int, set[Effect]] = {}
+tracked: WeakKeyDictionary[Callable[..., Any], set[Effect]] = WeakKeyDictionary()
 
 
 def function_source(func: FunctionType) -> str:
-    """Read the function text, including its decorator line.
+    """Return the matching definition from cached source, without decorators."""
 
-    ``inspect.getsource`` can stop on the decorator and drop the ``def``.
-    The effect scan needs the body, so this walks the lines itself.
-    """
+    source = "".join(linecache.getlines(func.__code__.co_filename, func.__globals__))
+    if not source:
+        return ""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return ""
 
-    if func.__code__.co_filename.startswith("<"):
-        return textwrap.dedent(inspect.getsource(func))
-    with open(func.__code__.co_filename, encoding="utf-8") as handle:
-        lines = handle.readlines()
-    index = func.__code__.co_firstlineno - 1
-    while index > 0 and lines[index - 1].lstrip().startswith("@"):
-        index -= 1
-
-    base = len(lines[index]) - len(lines[index].lstrip())
-    chunk: list[str] = []
-    seen_def = False
-
-    for line in lines[index:]:
-        if line.strip() == "":
-            chunk.append(line)
+    first_line = func.__code__.co_firstlineno
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        stripped = line.lstrip()
-        indent = len(line) - len(stripped)
-        if indent < base or (indent == base and seen_def):
-            break
-        if stripped.startswith(("def ", "async def ")):
-            seen_def = True
-        chunk.append(line)
-    return textwrap.dedent("".join(chunk))
+        definition_lines = {node.lineno, *(decorator.lineno for decorator in node.decorator_list)}
+        if node.name != func.__name__ or first_line not in definition_lines:
+            continue
+        segment = ast.get_source_segment(source, node)
+        if segment is not None:
+            return textwrap.dedent(segment)
+    return ""
 
 
 def callee_names(func: Callable[..., Any]) -> list[str]:
@@ -57,31 +51,42 @@ def callee_names(func: Callable[..., Any]) -> list[str]:
         source = function_source(func)
     except (OSError, TypeError):
         return []
-    tree = ast.parse(source)
+    if not source:
+        return []
+    try:
+        definition = ast.parse(source).body[0]
+    except (IndexError, SyntaxError):
+        return []
+    if not isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return []
     names: list[str] = []
 
-    def walk(node: ast.AST, *, nested: bool) -> None:
+    def walk(node: ast.AST) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            return
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            names.append(node.func.id)
         for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
-                if not nested:
-                    walk(child, nested=True)
-                continue
-            if nested and isinstance(child, ast.Call) and isinstance(child.func, ast.Name):
-                names.append(child.func.id)
+            walk(child)
 
-            walk(child, nested=nested)
-
-    walk(tree, nested=False)
+    for statement in definition.body:
+        walk(statement)
     return names
 
 
 def lookup(func: FunctionType, name: str) -> Any:
+    code = func.__code__
+    if name in code.co_varnames or name in code.co_cellvars:
+        return None
+
+    if name in code.co_freevars:
+        try:
+            return inspect.getclosurevars(func).nonlocals.get(name)
+        except ValueError:
+            return None
+
     if name in func.__globals__:
         return func.__globals__[name]
-
-    closure = inspect.getclosurevars(func)
-    if name in closure.nonlocals:
-        return closure.nonlocals[name]
 
     # print and open live on builtins, not in the module dict.
     return getattr(builtins, name, None)
@@ -90,14 +95,21 @@ def lookup(func: FunctionType, name: str) -> Any:
 def effects_used(func: Callable[..., Any]) -> set[Effect]:
     """Effects of the calls written in ``func``. Unknown calls perform nothing."""
 
-    if not isinstance(func, FunctionType):
-        return set()
     used: set[Effect] = set()
+    boundary_effect = getattr(func, "__fox_effect__", None)
+    if isinstance(boundary_effect, Effect):
+        used.add(boundary_effect)
+    if not isinstance(func, FunctionType):
+        return used
     for name in callee_names(func):
         callee = lookup(func, name)
         if callee is None:
             continue
-        used.update(tracked.get(id(callee), ()))
+        with suppress(TypeError):
+            used.update(tracked.get(callee, ()))
+        boundary_effect = getattr(callee, "__fox_effect__", None)
+        if isinstance(boundary_effect, Effect):
+            used.add(boundary_effect)
         callee_spec = getattr(callee, "__fox__", None)
         if isinstance(callee_spec, Spec):
             used.update(performed(callee_spec))

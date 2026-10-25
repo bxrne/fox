@@ -1,18 +1,21 @@
-"""Generate calls for pure @fox functions and let the contract judge them."""
+"""Generate calls for @fox functions and let their contracts judge them."""
 
 from __future__ import annotations
 
 import inspect
+import math
 import types
 from typing import Annotated, Any, Callable, Union, cast, get_args, get_origin, get_type_hints
 
 from hypothesis import HealthCheck, assume, given, settings
 from hypothesis import strategies as st
+from hypothesis.errors import Unsatisfiable
 from typing_extensions import ParamSpec
 
-from fox import Contracted, Spec, pure_functions
+from fox import Spec, fox, pure_functions
 from fox.contract import call_predicate
 from fox.effects import Between
+from fox.runtime import Handlers, _checking, _stack
 
 P = ParamSpec("P")
 _UNIONS = (Union, getattr(types, "UnionType", Union))
@@ -26,8 +29,14 @@ def strategy_for(annotation: Any) -> st.SearchStrategy[Any]:
     ``fox.between`` is the only bound. Without it, the draw is unbounded.
     """
 
-    low: float | None = None
-    high: float | None = None
+    return _strategy_for(annotation)
+
+
+def _strategy_for(
+    annotation: Any,
+    low: float | None = None,
+    high: float | None = None,
+) -> st.SearchStrategy[Any]:
     if get_origin(annotation) is Annotated:
         annotation, *meta = get_args(annotation)
         for item in meta:
@@ -38,9 +47,13 @@ def strategy_for(annotation: Any) -> st.SearchStrategy[Any]:
     if annotation is bool:
         return st.booleans()
     if annotation is int:
+        minimum = None if low is None else math.ceil(low)
+        maximum = None if high is None else math.floor(high)
+        if minimum is not None and maximum is not None and minimum > maximum:
+            raise ValueError(f"fox.between({low!r}, {high!r}) contains no representable integer")
         return st.integers(
-            min_value=None if low is None else int(low),
-            max_value=None if high is None else int(high),
+            min_value=minimum,
+            max_value=maximum,
         )
     if annotation is str:
         return st.text()
@@ -53,22 +66,35 @@ def strategy_for(annotation: Any) -> st.SearchStrategy[Any]:
     if origin is list and len(args) == 1:
         return st.lists(strategy_for(args[0]))
     if origin in _UNIONS and args:
-        return st.one_of(*(strategy_for(arg) for arg in args))
+        return st.one_of(*(_strategy_for(arg, low, high) for arg in args))
     raise TypeError(f"fox has no generator for {annotation!r}")
 
 
-def check(func: Contracted[P, Any]) -> None:
+def check(
+    func: Callable[P, Any],
+    *,
+    handlers: Handlers | None = None,
+) -> None:
     """Draw arguments from the annotations and call ``func``.
 
     Draws that fail ``requires`` are discarded. ``ensures`` and ``fox.claim``
-    inside the call are the test. The function must be pure and fully annotated.
+    inside the call are the test. Each reached ``@effect`` boundary needs a
+    replacement function. Unwrapped Python I/O is not sandboxed.
     """
 
+    if not __debug__:
+        raise RuntimeError("fox.check is disabled under python -O")
+    spec = getattr(func, "__fox__", None)
+    if not isinstance(spec, Spec):
+        raise TypeError("fox.check expects a function decorated with @fox")
     signature = inspect.signature(func)
-    spec: Spec = func.__fox__
+
+    original = inspect.unwrap(func)
+    target_name = getattr(original, "__qualname__", repr(func))
+    predicate_signature = inspect.signature(original)
+    receiver = (func.__self__,) if inspect.ismethod(func) else ()
 
     # Hints live on the user's function. The wrapper's globals cannot see fox.between.
-    original = getattr(func, "__wrapped__", func)
     hints = get_type_hints(original, include_extras=True)
 
     names: list[str] = []
@@ -76,10 +102,10 @@ def check(func: Contracted[P, Any]) -> None:
 
     for parameter in signature.parameters.values():
         if parameter.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
-            raise TypeError(f"{func.__name__} uses *args or **kwargs, which fox does not generate")
+            raise TypeError(f"{target_name} uses *args or **kwargs, which fox does not generate")
         annotation = hints.get(parameter.name, parameter.annotation)
         if annotation is inspect.Parameter.empty:
-            raise TypeError(f"{func.__name__} parameter {parameter.name} needs a type")
+            raise TypeError(f"{target_name} parameter {parameter.name} needs a type")
         names.append(parameter.name)
         parts.append(strategy_for(annotation))
 
@@ -90,15 +116,31 @@ def check(func: Contracted[P, Any]) -> None:
     )
     @given(st.tuples(*parts))
     def run(values: tuple[Any, ...]) -> None:
-        arguments = dict(zip(names, values))
+        bound = inspect.BoundArguments(signature, dict(zip(names, values)))
+        predicate_arguments = predicate_signature.bind(*receiver, *bound.args, **bound.kwargs)
+        predicate_arguments.apply_defaults()
 
         # A draw outside requires is not a bug. Skip it and keep searching.
-        for predicate in spec.requires:
-            assume(call_predicate(predicate, arguments))
+        token = _stack.set((*_stack.get(), spec))
+        try:
+            for predicate in spec.requires:
+                assume(call_predicate(predicate, predicate_arguments.arguments))
+        finally:
+            _stack.reset(token)
 
-        cast(Callable[..., Any], func)(**arguments)
+        cast(Callable[..., Any], func)(*bound.args, **bound.kwargs)
 
-    run()
+    try:
+        with fox.intercept({} if handlers is None else handlers):
+            token = _checking.set(True)
+            try:
+                run()
+            finally:
+                _checking.reset(token)
+    except Unsatisfiable as error:
+        raise Unsatisfiable(
+            f"fox.check could not generate a valid call for {target_name}: {error}"
+        ) from error
 
 
 def check_pure() -> int:

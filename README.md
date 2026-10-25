@@ -1,67 +1,77 @@
-# fox
+# Fox
 
-Delete the unit tests. Keep one end-to-end path. The contracts are the property tests.
-
-A unit test restates a function in another file, with three examples you thought of. It goes stale the week the function changes. Fox puts the rule on the function. Calling it checks the rule. `python -m fox` draws the inputs. You stop writing that file.
-
-End-to-end tests stay. A property cannot click through a login or prove the row landed. One e2e path plus the contracts is the suite.
-Fox can be left out when hitting production.
+Check what ordinary Python functions promise across generated calls—without changing their call style or turning I/O into generators.
 
 ```python
 from typing import Annotated
 
-from fox import effect, fox
+from fox import fox
 
-http = effect("http")
 
 @fox(
-    requires=lambda n: n >= 0,
-    ensures=lambda n, result: result * result <= n < (result + 1) * (result + 1),
+    requires=lambda cents, people: cents >= 0 and people > 0,
+    ensures=lambda cents, people, result: (
+        len(result) == people and sum(result) == cents and max(result) - min(result) <= 1
+    ),
 )
-def isqrt(n: Annotated[int, fox.between(0, 10_000)]) -> int:
-    root = 0
-    while (root + 1) * (root + 1) <= n:
-        fox.claim(root * root <= n)
-        root += 1
-    return root
+def split_bill(
+    cents: Annotated[int, fox.between(0, 10_000)],
+    people: Annotated[int, fox.between(1, 50)],
+) -> list[int]:
+    each, extra = divmod(cents, people)
+    return [each + 1 if index < extra else each for index in range(people)]
+
+
+fox.check(split_bill)
 ```
 
-`requires` binds the caller. `ensures` binds the function. Leave `effects` off and the function is pure, so Fox memoises it and generates its calls. `fox.between` is the only bound. Fox invents no range.
+Fox generates inputs and checks conservation and fairness. The runnable example also uses generated inputs to catch a floor-only implementation dropping remainder cents.
 
-An effect is a name you choose.
+## Ordinary calls around effects
 
 ```python
-@fox(effects=http)
-def post_note():
-    ...
+from pathlib import Path
+
+from fox import effect, fox
+
+
+@effect("io")
+def read_note(path: str) -> str:
+    return Path(path).read_text(encoding="utf-8")
+
+
+@effect("io")
+def write_note(path: str, content: str) -> None:
+    Path(path).write_text(content, encoding="utf-8")
+
+
+@fox(effects="io", ensures=lambda path, content, result: result == content.strip())
+def save_and_read(path: str, content: str) -> str:
+    write_note(path, content.strip())
+    return read_note(path)
+
+
+memory: dict[str, str] = {}
+fox.check(
+    save_and_read,
+    handlers={read_note: memory.__getitem__, write_note: memory.__setitem__},
+)
+
+with fox.intercept({read_note: memory.__getitem__, write_note: memory.__setitem__}):
+    print(save_and_read("draft", "  Preview copy  "))
 ```
 
-`fox.track(jsonify, http)` says that calling `jsonify` performs `http`. Calling another `@fox` function performs the effects that function names. A pure function that reaches HTTP fails at the definition.
+An effect marks a replaceable synchronous boundary; the function still receives normal arguments and returns a normal value. Handlers are keyed by boundary function, not the shared `"io"` label, and only reached boundaries need one.
 
-## Move a project
+Eligible pure calls may use a bounded cache for immutable built-in arguments and results; pass `memoize=False` to `@fox` to opt out. `fox.check` bypasses the cache. Use `fox.claim(lambda: condition)` for a lazy body invariant; `python -O` skips evaluating its callable.
 
-1. Decorate the pure functions. `requires` and `ensures` replace the example tables. Delete those unit tests.
-2. Name the edges. `effect("http")`, `effect("db")`. Fox will not invent those calls. Your e2e test is what runs them.
-3. Run the properties. Keep the one test that boots the app and hits the route.
+Contracts check outcomes for the calls they exercise; they do not prove every possible execution or that an arbitrary external side effect occurred. Only calls routed through `@effect` are replaceable—unwrapped I/O in a function, predicate, or handler remains real. Async and generator functions are unsupported. Under `python -O`, contracts and effect checks are removed; `fox.check` and `fox.intercept` are unavailable.
 
-```bash
-uv run python -m fox examples/isqrt.py
-uv run --group examples python examples/notes.py
+## Run the showcase
+
+```sh
+uv run python -m fox examples/contracts.py
+uv run python examples/contracts.py
+uv run python examples/effects.py
+uv run python -O examples/effects.py
 ```
-
-[`examples/isqrt.py`](examples/isqrt.py) has no unit test. The contract is the property. [`examples/notes.py`](examples/notes.py) is a Flask `POST /notes`: `make_note` is checked for free, and the route is the end-to-end path. A blank note is 400. A real note is 200.
-
-`PreconditionError` is a bad caller. `PostconditionError` is a bad body. `EffectError` is an effect the function did not name.
-
-Ship with the checks compiled out. Pure functions stay memoised.
-
-```bash
-python -O -m yourapp
-```
-
-## Lineage
-
-- Design by contract. Bertrand Meyer, Eiffel `require` and `ensure`. [Design by contract](https://en.wikipedia.org/wiki/Design_by_contract), [Eiffel](https://www.eiffel.org/).
-- The same idea on Python functions. [icontract](https://github.com/Parquery/icontract), [deal](https://github.com/life4/deal), [dpcontracts](https://github.com/deadpixi/contracts).
-- The property is the test. [QuickCheck](https://hackage.haskell.org/package/QuickCheck) (Claessen and Hughes), [Hypothesis](https://hypothesis.readthedocs.io/) (MacIver and Hatfield-Dodds).
-- Effects are part of the interface. [Plotkin and Pretnar](https://homepages.inf.ed.ac.uk/gdp/publications/Effect_Handlers.html), [Koka](https://koka-lang.github.io/koka/doc/book.html) (Leijen).
