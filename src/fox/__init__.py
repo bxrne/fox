@@ -8,11 +8,11 @@ from __future__ import annotations
 
 import functools
 import inspect
-from collections.abc import Callable, Generator, Iterable, Mapping
-from contextlib import contextmanager
+from collections.abc import Callable, Iterable
+from contextlib import AbstractContextManager
 from typing import Any, TypeVar, cast, overload
 
-from typing_extensions import ParamSpec, Protocol
+from typing_extensions import Concatenate, ParamSpec, Protocol
 
 from fox.contract import (
     EffectInput,
@@ -25,16 +25,18 @@ from fox.contract import (
     performed,
     predicates,
 )
-from fox.effects import PURE, Between, Effect, EffectCall, effect, synchronous
+from fox.effects import PURE, Between, Effect, effect, synchronous
 from fox.errors import EffectError, FailedClaim, PostconditionError, PreconditionError
 from fox.memo import memoized
-from fox.runtime import _checking, _drive, _handlers, _stack
+from fox.runtime import Handlers, _stack, intercept
 from fox.trace import effects_used, reject_unnamed, tracked
 
 P = ParamSpec("P")
+Q = ParamSpec("Q")
 R = TypeVar("R")
 R_co = TypeVar("R_co", covariant=True)
 R_call = TypeVar("R_call")
+T = TypeVar("T")
 
 pure_functions: list[Contracted[Any, Any]] = []
 
@@ -52,14 +54,18 @@ class Contracted(Protocol[P, R_co]):
 
     def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R_co: ...
 
+    @overload
+    def __get__(self, instance: None, owner: type[Any] | None = None) -> Contracted[P, R_co]: ...
+
+    @overload
+    def __get__(
+        self: Contracted[Concatenate[T, Q], R_co],
+        instance: T,
+        owner: type[T] | None = None,
+    ) -> Contracted[Q, R_co]: ...
+
 
 class FoxDecorator(Protocol):
-    @overload
-    def __call__(
-        self, func: Callable[P, Generator[EffectCall, Any, R_call]]
-    ) -> Contracted[P, R_call]: ...
-
-    @overload
     def __call__(self, func: Callable[P, R_call]) -> Contracted[P, R_call]: ...
 
 
@@ -68,17 +74,12 @@ def _checked(
     runner: Callable[P, R],
     *,
     spec: Spec,
-    is_generator: bool,
 ) -> Contracted[P, R]:
     signature = inspect.signature(target)
     reject_unnamed(performed(spec), effects_used(target))
 
     @functools.wraps(target)
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
-        if _checking.get() and not spec.pure and not is_generator:
-            raise TypeError(
-                "generated effectful calls must be generators yielding fox.perform(...)"
-            )
         parent = _stack.get()
         if parent:
             reject_unnamed(performed(parent[-1]), set(performed(spec)))
@@ -97,7 +98,7 @@ def _checked(
     contracted = cast(Contracted[P, R], wrapper)
     contracted.__fox__ = spec
 
-    # Only pure functions are generated. An effectful call would hit the world.
+    # The CLI needs no handlers for pure functions.
     if spec.pure:
         pure_functions.append(contracted)
     return contracted
@@ -110,17 +111,15 @@ class fox:
     the parameter names plus ``result``. ``effects`` names what the body may do.
     The default is ``pure``. Pass one predicate or a sequence of predicates.
 
-    Pure non-generator functions use a bounded cache for immutable built-in
-    values, unless ``memoize=False``. Generators are driven and never memoised.
+    Pure functions use a bounded cache for immutable built-in values, unless
+    ``memoize=False``. Decorate I/O boundaries with ``@effect(\"io\")`` and
+    call them normally; tests replace these functions with ordinary callables.
     ``python -O`` drops the contracts and effect checks. Use a lazy callable
     with ``fox.claim`` to skip evaluating the condition in optimised builds.
 
     Register an effectful call with ``fox.track(print, log)``. Calling another
     ``@fox`` function performs the effects that function names.
     """
-
-    @overload
-    def __new__(cls, func: Callable[P, Generator[EffectCall, Any, R]], /) -> Contracted[P, R]: ...
 
     @overload
     def __new__(cls, func: Callable[P, R], /) -> Contracted[P, R]: ...
@@ -154,22 +153,12 @@ class fox:
 
         def decorate(target: Callable[P, R]) -> Contracted[P, R]:
             synchronous(target, "fox")
-            call = target.__call__
-            is_generator = inspect.isgeneratorfunction(target) or inspect.isgeneratorfunction(call)
-            if is_generator:
-
-                @functools.wraps(target)
-                def runner(*args: P.args, **kwargs: P.kwargs) -> R:
-                    return cast(R, _drive(target(*args, **kwargs), checked=__debug__))
-
-            else:
-                runner = memoized(target) if memoize and PURE in declared else target
+            runner = memoized(target) if memoize and PURE in declared else target
             if spec is not None:
                 return _checked(
                     target,
                     runner,
                     spec=spec,
-                    is_generator=is_generator,
                 )
             return cast(Contracted[P, R], runner)
 
@@ -201,45 +190,21 @@ class fox:
             raise TypeError("fox.track requires a weak-referenceable, hashable callable") from error
 
     @staticmethod
-    def perform(
-        named_effect: Effect | str,
-        function: Callable[P, R],
-        /,
-        *args: P.args,
-        **kwargs: P.kwargs,
-    ) -> EffectCall:
-        """Yield an interceptable call from a generator decorated with ``@fox``."""
+    def intercept(handlers: Handlers) -> AbstractContextManager[None]:
+        """Temporarily replace ``@effect`` functions with ordinary callables."""
 
-        return EffectCall(one_effect(named_effect), function, args, kwargs)
-
-    @staticmethod
-    @contextmanager
-    def intercept(
-        named_effect: Effect | str, handler: Callable[[EffectCall], Any]
-    ) -> Generator[None, None, None]:
-        """Handle one yielded effect in the current context; intended for tests."""
-
-        if not __debug__:
-            raise RuntimeError("fox effect interception is disabled under python -O")
-        synchronous(handler, "fox.intercept")
-        chosen = one_effect(named_effect)
-        if chosen == PURE:
-            raise ValueError("pure cannot be intercepted")
-        handlers = dict(_handlers.get() or {})
-        handlers[chosen] = handler
-        token = _handlers.set(handlers)
-        try:
-            yield
-        finally:
-            _handlers.reset(token)
+        return intercept(handlers)
 
     @staticmethod
     def check(
-        func: Contracted[P, Any],
+        func: Callable[P, Any],
         *,
-        handlers: Mapping[Effect | str, Callable[[EffectCall], Any]] | None = None,
+        handlers: Handlers | None = None,
     ) -> None:
-        """Generate calls and check contracts, optionally replacing yielded effects."""
+        """Generate calls, replacing effect boundaries with the supplied functions."""
+
+        if not __debug__:
+            raise RuntimeError("fox.check is disabled under python -O")
 
         from fox.check import check
 
@@ -266,7 +231,6 @@ def _claim(condition: bool, message: str) -> None:
 
 __all__ = [
     "Effect",
-    "EffectCall",
     "EffectError",
     "FailedClaim",
     "PostconditionError",
