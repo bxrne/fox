@@ -1,156 +1,192 @@
-from collections.abc import Generator
 from contextvars import Context
 from typing import Any
 
 import pytest
 
-from fox import EffectCall, EffectError, PostconditionError, PreconditionError, fox
+from fox import EffectError, PostconditionError, PreconditionError, effect, fox
 
 
-def test_generator_checks_final_result_and_requires_before_body() -> None:
-    calls = []
+def test_contracts_apply_before_and_after_effect_boundary_calls() -> None:
+    real_calls: list[int] = []
 
-    @fox(requires=lambda n: n > 0, ensures=lambda result: result == 2, effects="io")
-    def run(n: int) -> Generator[EffectCall, Any, int]:
-        calls.append(n)
-        return (yield fox.perform("io", lambda: n + 1))
+    @effect("io")
+    def read(value: int) -> int:
+        real_calls.append(value)
+        return value + 1
+
+    @fox(
+        effects="io",
+        requires=lambda value: value > 0,
+        ensures=lambda value, result: result == value + 1,
+    )
+    def run(value: int) -> int:
+        return read(value)
 
     with pytest.raises(PreconditionError):
         run(0)
-    assert calls == []
+    assert real_calls == []
     assert run(1) == 2
-    with pytest.raises(PostconditionError):
-        run(2)
+
+    with fox.intercept({read: lambda value: value + 1}):
+        assert run(2) == 3
+    with fox.intercept({read: lambda value: 0}):
+        with pytest.raises(PostconditionError):
+            run(2)
+    assert real_calls == [1]
 
 
-def test_effects_forward_arguments_results_and_handle_failures() -> None:
-    events = []
+def test_replacements_forward_arguments_and_distinguish_same_named_effects() -> None:
+    real_calls: list[str] = []
+    replacement_calls: list[tuple[str, str, str]] = []
 
-    def read(path: str, *, encoding: str) -> str:
-        events.append((path, encoding))
+    @effect("io")
+    def read(path: str, *, encoding: str = "utf-8") -> str:
+        real_calls.append("read")
+        return f"real-read:{path}:{encoding}"
+
+    @effect("io")
+    def write(path: str, contents: str) -> str:
+        real_calls.append("write")
+        return f"real-write:{path}:{contents}"
+
+    @fox(effects="io")
+    def read_default(path: str) -> str:
+        return read(path)
+
+    @fox(effects="io")
+    def read_encoded(path: str, *, encoding: str) -> str:
+        return read(path, encoding=encoding)
+
+    @fox(effects="io")
+    def write_file(path: str, contents: str) -> str:
+        return write(path, contents)
+
+    def fake_read(path: str, *, encoding: str = "utf-8") -> str:
+        replacement_calls.append(("read", path, encoding))
+        return f"fake-read:{path}:{encoding}"
+
+    def fake_write(path: str, contents: str) -> str:
+        replacement_calls.append(("write", path, contents))
+        return f"fake-write:{path}:{contents}"
+
+    with fox.intercept({read: fake_read, write: fake_write}):
+        assert read_default("notes.txt") == "fake-read:notes.txt:utf-8"
+        assert read_encoded("notes.txt", encoding="utf-16") == "fake-read:notes.txt:utf-16"
+        assert write_file("notes.txt", "hello") == "fake-write:notes.txt:hello"
+
+    assert replacement_calls == [
+        ("read", "notes.txt", "utf-8"),
+        ("read", "notes.txt", "utf-16"),
+        ("write", "notes.txt", "hello"),
+    ]
+    assert real_calls == []
+
+
+def test_interceptors_nest_restore_after_errors_and_are_context_local() -> None:
+    @effect("io")
+    def read() -> str:
+        return "real-read"
+
+    @effect("io")
+    def write() -> str:
+        return "real-write"
+
+    @fox(effects="io")
+    def both() -> tuple[str, str]:
+        return read(), write()
+
+    outer = {read: lambda: "outer-read", write: lambda: "outer-write"}
+    with fox.intercept(outer):
+        assert both() == ("outer-read", "outer-write")
+        with fox.intercept({read: lambda: "inner-read"}):
+            assert both() == ("inner-read", "outer-write")
+            with pytest.raises(ValueError):
+                with fox.intercept({read: lambda: "failed-scope"}):
+                    assert both() == ("failed-scope", "outer-write")
+                    raise ValueError("leave handler scope")
+            assert both() == ("inner-read", "outer-write")
+        assert both() == ("outer-read", "outer-write")
+        assert Context().run(both) == ("real-read", "real-write")
+    assert both() == ("real-read", "real-write")
+
+
+def test_handler_errors_follow_normal_try_finally_flow() -> None:
+    real_calls: list[str] = []
+    cleanup: list[str] = []
+
+    @effect("io")
+    def read() -> str:
+        real_calls.append("called")
         raise OSError("offline")
 
     @fox(effects="io")
-    def run() -> Generator[EffectCall, Any, str]:
+    def load() -> str:
         try:
-            yield fox.perform("io", read, "note.txt", encoding="utf-8")
-        except OSError:
-            value = yield fox.perform("io", str, "fallback")
-            return value
-        finally:
-            events.append("closed")
-        return "unexpected"
-
-    assert run() == "fallback"
-    assert events == [("note.txt", "utf-8"), "closed"]
-    with fox.intercept("io", lambda request: "mocked"):
-        assert run() == "unexpected"
-    assert events[-1] == "closed"
-
-
-def test_interceptors_are_nested_scoped_and_context_local() -> None:
-    @fox(effects="io")
-    def read() -> Generator[EffectCall, Any, str]:
-        return (yield fox.perform("io", lambda: "real"))
-
-    with fox.intercept("io", lambda request: "outer"):
-        assert read() == "outer"
-        assert Context().run(read) == "real"
-        with pytest.raises(ValueError), fox.intercept("io", lambda request: "inner"):
-            assert read() == "inner"
-            raise ValueError("leave handler")
-        assert read() == "outer"
-    assert read() == "real"
-
-
-def test_handler_exceptions_are_thrown_at_the_yield() -> None:
-    @fox(effects="io")
-    def read() -> Generator[EffectCall, Any, str]:
-        try:
-            return (yield fox.perform("io", lambda: "real"))
+            return read()
         except FileNotFoundError:
             return "missing"
+        except OSError:
+            return "offline"
+        finally:
+            cleanup.append("closed")
 
-    def fail(request: EffectCall) -> None:
+    assert load() == "offline"
+
+    def fail() -> str:
         raise FileNotFoundError("fake path")
 
-    with fox.intercept("io", fail):
-        assert read() == "missing"
+    with fox.intercept({read: fail}):
+        assert load() == "missing"
+
+    assert real_calls == ["called"]
+    assert cleanup == ["closed", "closed"]
 
 
-def test_invalid_yield_closes_generator_and_restores_effect_stack() -> None:
-    events = []
+def test_dynamic_effect_calls_fail_before_the_boundary_body() -> None:
+    body_calls: list[str] = []
 
-    @fox
-    def invalid() -> Generator[Any, Any, None]:
-        try:
-            yield "not an effect"
-        finally:
-            events.append("closed")
-
-    with pytest.raises(TypeError, match="must yield"):
-        invalid()
-    assert events == ["closed"]
-
-    @fox(effects="io")
-    def next_call() -> Generator[EffectCall, Any, int]:
-        return (yield fox.perform("io", int, 1))
-
-    assert next_call() == 1
-
-
-def test_dynamic_nested_effects_are_checked_before_preconditions() -> None:
-    events = []
-
-    def requires() -> bool:
-        events.append("precondition")
-        return True
-
-    @fox(effects="io", requires=requires)
-    def io() -> int:
+    @effect("io")
+    def read() -> int:
+        body_calls.append("read")
         return 1
 
     @fox
-    def pure(callback: Any) -> int:
+    def indirect(callback: Any) -> int:
         return callback()
 
     with pytest.raises(EffectError, match="io"):
-        pure(io)
-    assert events == []
+        indirect(read)
+    assert body_calls == []
 
 
-def test_generator_delegation_and_nested_decorated_calls() -> None:
-    def helper() -> Generator[EffectCall, Any, int]:
-        return (yield fox.perform("io", int, 1))
+def test_interceptors_reject_invalid_boundaries_and_replacements() -> None:
+    @effect("io")
+    def read() -> str:
+        return "real"
 
-    @fox(effects="io")
-    def inner() -> Generator[EffectCall, Any, int]:
-        return (yield from helper())
+    def unmarked() -> str:
+        return "unmarked"
 
-    @fox(effects="io")
-    def outer() -> Generator[EffectCall, Any, int]:
-        result = inner()
-        return result + (yield from helper())
+    async def async_replacement() -> str:
+        return "async"
 
-    with fox.intercept("io", lambda request: 3):
-        assert outer() == 6
+    def generator_replacement() -> Any:
+        yield "generator"
 
+    invalid_handlers: list[Any] = [
+        {unmarked: lambda: "fake"},
+        {"io": lambda: "fake"},
+        {read: object()},
+        {read: async_replacement},
+        {read: generator_replacement},
+    ]
+    for handlers in invalid_handlers:
+        with pytest.raises(TypeError):
+            with fox.intercept(handlers):
+                pass
 
-def test_requests_reject_pure_and_invalid_callables() -> None:
     with pytest.raises(ValueError, match="pure"):
-        fox.perform("pure", int, 1)
-
-    async def async_call() -> int:
-        return 1
-
-    with pytest.raises(TypeError, match="not async"):
-        fox.perform("io", async_call)
-
-    async def async_handler(request: EffectCall) -> int:
-        return 1
-
-    with pytest.raises(TypeError, match="not async"), fox.intercept("io", async_handler):
-        pass
+        effect("pure")(lambda: None)
 
 
 def test_invalid_tracking_does_not_partially_register_effects() -> None:

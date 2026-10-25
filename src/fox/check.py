@@ -5,8 +5,6 @@ from __future__ import annotations
 import inspect
 import math
 import types
-from collections.abc import Mapping
-from contextlib import ExitStack
 from typing import Annotated, Any, Callable, Union, cast, get_args, get_origin, get_type_hints
 
 from hypothesis import HealthCheck, assume, given, settings
@@ -14,10 +12,10 @@ from hypothesis import strategies as st
 from hypothesis.errors import Unsatisfiable
 from typing_extensions import ParamSpec
 
-from fox import Contracted, Spec, fox, pure_functions
+from fox import Spec, fox, pure_functions
 from fox.contract import call_predicate
-from fox.effects import Between, Effect, EffectCall
-from fox.runtime import _checking
+from fox.effects import Between
+from fox.runtime import Handlers, _checking, _stack
 
 P = ParamSpec("P")
 _UNIONS = (Union, getattr(types, "UnionType", Union))
@@ -73,31 +71,28 @@ def _strategy_for(
 
 
 def check(
-    func: Contracted[P, Any],
+    func: Callable[P, Any],
     *,
-    handlers: Mapping[Effect | str, Callable[[EffectCall], Any]] | None = None,
+    handlers: Handlers | None = None,
 ) -> None:
     """Draw arguments from the annotations and call ``func``.
 
     Draws that fail ``requires`` are discarded. ``ensures`` and ``fox.claim``
-    inside the call are the test. Effectful checks require a generator and a
-    handler for each declared effect. Interception applies only to explicit
-    ``fox.perform(...)`` requests; it does not sandbox arbitrary I/O in a body.
+    inside the call are the test. Each reached ``@effect`` boundary needs a
+    replacement function. Unwrapped Python I/O is not sandboxed.
     """
 
+    if not __debug__:
+        raise RuntimeError("fox.check is disabled under python -O")
+    spec = getattr(func, "__fox__", None)
+    if not isinstance(spec, Spec):
+        raise TypeError("fox.check expects a function decorated with @fox")
     signature = inspect.signature(func)
-    spec: Spec = func.__fox__
-
-    supplied = {key if isinstance(key, Effect) else Effect(key) for key in (handlers or {})}
-    missing = spec.effects - supplied
-    if not spec.pure and missing:
-        names = ", ".join(sorted(item.name for item in missing))
-        raise TypeError(f"fox.check needs handlers for declared effects: {names}")
 
     original = inspect.unwrap(func)
     target_name = getattr(original, "__qualname__", repr(func))
-    if not spec.pure and not inspect.isgeneratorfunction(original):
-        raise TypeError(f"fox.check requires effectful function {target_name} to be a generator")
+    predicate_signature = inspect.signature(original)
+    receiver = (func.__self__,) if inspect.ismethod(func) else ()
 
     # Hints live on the user's function. The wrapper's globals cannot see fox.between.
     hints = get_type_hints(original, include_extras=True)
@@ -122,17 +117,21 @@ def check(
     @given(st.tuples(*parts))
     def run(values: tuple[Any, ...]) -> None:
         bound = inspect.BoundArguments(signature, dict(zip(names, values)))
+        predicate_arguments = predicate_signature.bind(*receiver, *bound.args, **bound.kwargs)
+        predicate_arguments.apply_defaults()
 
         # A draw outside requires is not a bug. Skip it and keep searching.
-        for predicate in spec.requires:
-            assume(call_predicate(predicate, bound.arguments))
+        token = _stack.set((*_stack.get(), spec))
+        try:
+            for predicate in spec.requires:
+                assume(call_predicate(predicate, predicate_arguments.arguments))
+        finally:
+            _stack.reset(token)
 
         cast(Callable[..., Any], func)(*bound.args, **bound.kwargs)
 
     try:
-        with ExitStack() as stack:
-            for named_effect, handler in (handlers or {}).items():
-                stack.enter_context(fox.intercept(named_effect, handler))
+        with fox.intercept({} if handlers is None else handlers):
             token = _checking.set(True)
             try:
                 run()

@@ -1,96 +1,91 @@
-# fox
+# Fox
 
-Delete the unit tests. Keep one end-to-end path. The contracts are the property tests.
+Contracts and property checks for ordinary Python functions. Put the rule beside the function; keep its body and call sites normal.
 
-A unit test restates a function in another file, with three examples you thought of. It goes stale the week the function changes. Fox puts the rule on the function. Calling it checks the rule. `python -m fox` draws the inputs. You stop writing that file.
-
-End-to-end tests stay. A property cannot click through a login or prove the row landed. One e2e path plus the contracts is the suite.
-Fox checks can be disabled in production.
+## Start with a pure function
 
 ```python
+import math
 from typing import Annotated
 
-from fox import effect, fox
-
-http = effect("http")
+from fox import fox
 
 
 @fox(
     requires=lambda n: n >= 0,
-    ensures=lambda n, result: result * result <= n < (result + 1) * (result + 1),
+    ensures=lambda n, result: result >= 0
+    and result * result <= n < (result + 1) ** 2,
 )
-def isqrt(n: Annotated[int, fox.between(0, 10_000)]) -> int:
-    root = 0
-    while (root + 1) * (root + 1) <= n:
-        fox.claim(root * root <= n)
-        root += 1
-    return root
+def floor_sqrt(n: Annotated[int, fox.between(0, 10_000)]) -> int:
+    return math.isqrt(n)
 ```
 
-`requires` binds the caller. `ensures` binds the function. Leave `effects` off to declare the function pure and let Fox generate its calls. `fox.between` bounds the generated values; integer bounds round inward, and bounds on optional numbers apply to the numeric values.
+Fox generates inputs for the annotation and checks the precondition and mathematical postcondition. That invariant catches an off-by-one result. The wrapper keeps ordinary positional and keyword calls; `fox.check(func)` generates calls from the annotated signature, checks one function, and bypasses pure-call caching.
 
-Pure functions use a bounded cache when their arguments and results are immutable built-in values. Mutable values, custom objects, iterators, and generators are not cached. Use `@fox(memoize=False)` when calls must always run or object identity matters. Declaring a function pure is your promise, not proof that its body is deterministic.
+## Keep I/O as ordinary calls
 
-An effect is a name you choose.
-
-```python
-@fox(effects=http)
-def post_note(): ...
-```
-
-`fox.track(jsonify, http)` says that calling `jsonify` performs `http`. Calling another `@fox` function performs the effects that function names. Fox checks known direct calls at decoration time and nested `@fox` calls at runtime. The source scan is best-effort: it does not infer effects for arbitrary Python code.
-
-For an effect that tests need to replace, write a generator and yield an explicit request:
+Mark the boundary, then call it normally. A boundary stays a synchronous ordinary call: the implementation or fake receives the same arguments, and its return value comes back:
 
 ```python
-from collections.abc import Generator
 from pathlib import Path
-from typing import Any
 
-from fox import EffectCall, fox
+from fox import effect, fox
 
 
-@fox(effects="io")
-def read_note(path: str) -> Generator[EffectCall, Any, str]:
-    return (yield fox.perform("io", Path(path).read_text))
+@effect("io")
+def read_note(path: str) -> str:
+    return Path(path).read_text(encoding="utf-8")
+
+
+@effect("io")
+def write_note(path: str, content: str) -> None:
+    Path(path).write_text(content, encoding="utf-8")
+
+
+@fox(
+    effects="io",
+    requires=lambda path: bool(path),
+    ensures=lambda path, result: result == result.strip(),
+)
+def title(path: str) -> str:
+    return read_note(path).strip()
+
+
+@fox(
+    effects="io",
+    requires=lambda path, content: bool(path),
+    ensures=lambda path, content, result: result == content,
+)
+def save_note(path: str, content: str) -> str:
+    write_note(path, content)
+    return content
+
+
+fox.check(title, handlers={read_note: lambda path: "  Hello\n"})
+fox.check(save_note, handlers={write_note: lambda path, content: None})
+
+with fox.intercept({read_note: lambda path: "  Preview\n"}):
+    print(title("unused.txt"))
 ```
 
-Normal calls drive the generator and return its final value. Tests can replace yielded requests with `fox.intercept("io", handler)` or generate calls with explicit handlers:
+`@effect("io")` labels synchronous boundaries. In `fox.check`, handlers are keyed by those decorated functions and receive the same ordinary arguments; the `io` label does not merge `read_note` and `write_note`. Only reached boundaries need handlers. A missing handler raises `EffectError` before that boundary's real body runs. `fox.intercept` provides scoped, context-local overrides and can be nested.
 
-```python
-fox.check(read_note, handlers={"io": lambda request: "a test note"})
+Fox does not sandbox arbitrary Python I/O: only calls routed through an `@effect` boundary are replaceable. Wrapping external operations is the application's responsibility. `fox.track` is an advanced, best-effort static annotation for third-party calls; it does not intercept them.
+
+## Runtime notes
+
+- Eligible pure calls may use a bounded cache for immutable built-in arguments and results. Use `@fox(memoize=False)` to opt out; `fox.check` bypasses the cache.
+- Bound generated values with `Annotated[int, fox.between(low, high)]`. `fox.claim(lambda: condition)` checks a body invariant in normal mode and skips evaluating the callable under `python -O`.
+- `python -O` removes contracts, effect checks, and effect metadata; `@effect` leaves the original callable and the safe cache remains. `fox.check` and `fox.intercept` raise `RuntimeError` rather than pretending to check. The ordinary `fox` import does not import Hypothesis.
+- Functions and effect boundaries must be synchronous. Async and generator functions are rejected with clear errors.
+- `PreconditionError`, `PostconditionError`, and `EffectError` identify caller, result, and effect-contract failures.
+
+## Examples
+
+Both scripts use only the standard library beyond Fox. `effects.py` writes only inside a temporary directory.
+
+```sh
+uv run python -m fox examples/contracts.py
+uv run python examples/contracts.py
+uv run python examples/effects.py
 ```
-
-The handler receives an `EffectCall` containing the effect, callable, positional arguments, and keyword arguments. Handler results are sent back to the generator; exceptions are raised at the yield so normal `try`/`except`/`finally` works. Interceptors are scoped to their context, including nested overrides.
-
-`fox.check` requires a handler for every declared effect and rejects ordinary effectful functions before calling them. All replaceable I/O must go through `fox.perform`: direct calls in the body, predicates, or handlers are still real Python, not sandboxed. Generated checks bypass memoisation so the body is exercised each time.
-
-The decorator preserves argument types and exposes a generator's final return type. Only synchronous functions and generators are supported; async callables are rejected. Under `python -O`, interception is unavailable and yielded requests invoke their real callables.
-
-## Move a project
-
-1. Decorate the pure functions. `requires` and `ensures` replace the example tables. Delete those unit tests.
-2. Name the edges. `effect("http")`, `effect("db")`. Fox will not invent those calls. Your e2e test is what runs them.
-3. Run the properties. Keep the one test that boots the app and hits the route.
-
-```bash
-uv run python -m fox examples/isqrt.py
-uv run --group examples python examples/notes.py
-```
-
-[`examples/isqrt.py`](examples/isqrt.py) has no unit test. The contract is the property. [`examples/notes.py`](examples/notes.py) is a Flask `POST /notes`: `make_note` is checked for free, and the route is the end-to-end path. A blank note is 400. A real note is 200.
-
-`PreconditionError` is a bad caller. `PostconditionError` is a bad body. `EffectError` is an effect the function did not name.
-
-Ship with the checks compiled out. Eligible pure calls still use the bounded cache; generators always run. `requires` and `ensures` are not evaluated. For body checks, use `fox.claim(lambda: expensive_check())` to skip evaluating the condition as well: Python still evaluates ordinary arguments such as `fox.claim(expensive_check())` before calling Fox.
-
-```bash
-python -O -m yourapp
-```
-
-## Lineage
-
-- Design by contract. Bertrand Meyer, Eiffel `require` and `ensure`. [Design by contract](https://en.wikipedia.org/wiki/Design_by_contract), [Eiffel](https://www.eiffel.org/).
-- The same idea on Python functions. [icontract](https://github.com/Parquery/icontract), [deal](https://github.com/life4/deal), [dpcontracts](https://github.com/deadpixi/contracts).
-- The property is the test. [QuickCheck](https://hackage.haskell.org/package/QuickCheck) (Claessen and Hughes), [Hypothesis](https://hypothesis.readthedocs.io/) (MacIver and Hatfield-Dodds).
-- Effects are part of the interface. [Plotkin and Pretnar](https://homepages.inf.ed.ac.uk/gdp/publications/Effect_Handlers.html), [Koka](https://koka-lang.github.io/koka/doc/book.html) (Leijen).
