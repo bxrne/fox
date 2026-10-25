@@ -95,15 +95,21 @@ def lookup(func: FunctionType, name: str) -> Any:
 def effects_used(func: Callable[..., Any]) -> set[Effect]:
     """Effects of the calls written in ``func``. Unknown calls perform nothing."""
 
-    if not isinstance(func, FunctionType):
-        return set()
     used: set[Effect] = set()
+    boundary_effect = getattr(func, "__fox_effect__", None)
+    if isinstance(boundary_effect, Effect):
+        used.add(boundary_effect)
+    if not isinstance(func, FunctionType):
+        return used
     for name in callee_names(func):
         callee = lookup(func, name)
         if callee is None:
             continue
         with suppress(TypeError):
             used.update(tracked.get(callee, ()))
+        boundary_effect = getattr(callee, "__fox_effect__", None)
+        if isinstance(boundary_effect, Effect):
+            used.add(boundary_effect)
         callee_spec = getattr(callee, "__fox__", None)
         if isinstance(callee_spec, Spec):
             used.update(performed(callee_spec))
