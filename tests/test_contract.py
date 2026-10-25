@@ -162,3 +162,55 @@ def test_spec_is_stored() -> None:
 
     assert shown.__fox__.pure is False
     assert len(shown.__fox__.requires) == 1
+
+
+def test_generator_effect_is_intercepted() -> None:
+    seen: list[tuple[str, tuple[object, ...]]] = []
+
+    @fox(effects="io")
+    def load(path: str) -> str:
+        value = yield fox.perform("io", open, path)
+        return value
+
+    def fake_io(request: object) -> str:
+        seen.append((request.effect.name, request.args))
+        return "stubbed"
+
+    with fox.intercept("io", fake_io):
+        assert load("notes.txt") == "stubbed"
+    assert seen == [("io", ("notes.txt",))]
+
+
+def test_check_requires_handlers_for_effectful_generators() -> None:
+    from fox.check import check
+
+    @fox(effects="io")
+    def load(path: str) -> str:
+        return (yield fox.perform("io", open, path))
+
+    with pytest.raises(TypeError, match="handlers"):
+        check(load)
+
+    seen: list[str] = []
+
+    def fake_io(request: object) -> str:
+        seen.append(request.args[0])
+        return "stubbed"
+
+    check(load, handlers={"io": fake_io})
+    assert seen
+
+
+def test_generator_effects_execute_in_optimized_mode() -> None:
+    script = (
+        "from fox import fox\n"
+        "@fox(effects='io')\n"
+        "def load():\n"
+        "    result = yield fox.perform('io', lambda: 'ok')\n"
+        "    return result\n"
+        "print(load())\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-O", "-c", script], check=True, capture_output=True, text=True
+    )
+    assert result.stdout.strip() == "ok"
