@@ -12,7 +12,12 @@ from pathlib import Path
 def _load(target: str) -> None:
     path = Path(target)
     if path.suffix == ".py":
-        runpy.run_path(str(path), run_name="fox_subject")
+        previous_path = sys.path[:]
+        sys.path.insert(0, str(path.resolve().parent))
+        try:
+            runpy.run_path(str(path), run_name="fox_subject")
+        finally:
+            sys.path[:] = previous_path
         return
     importlib.import_module(target)
 
