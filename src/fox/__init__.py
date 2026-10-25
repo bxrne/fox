@@ -7,7 +7,9 @@ build. ``python -O`` compiles the checks out and leaves the memo table.
 from __future__ import annotations
 
 import functools
-from collections.abc import Callable, Iterable
+import inspect
+from collections.abc import Callable, Generator, Iterable
+from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from typing import Any, TypeVar, cast, overload
 
@@ -17,7 +19,6 @@ from fox.contract import (
     EffectInput,
     Predicate,
     Spec,
-    bind,
     check_ensures,
     check_requires,
     effects_of,
@@ -25,18 +26,24 @@ from fox.contract import (
     performed,
     predicates,
 )
-from fox.effects import PURE, Between, Effect, effect
+from fox.effects import PURE, Between, Effect, EffectCall, effect
 from fox.errors import EffectError, FailedClaim, PostconditionError, PreconditionError
+from fox.memo import memoized
 from fox.trace import effects_used, reject_unnamed, tracked
 
 P = ParamSpec("P")
 R = TypeVar("R")
+R_co = TypeVar("R_co", covariant=True)
+R_call = TypeVar("R_call")
 
 _stack: ContextVar[tuple[Spec, ...]] = ContextVar("fox_stack", default=())
+_handlers: ContextVar[dict[Effect, Callable[[EffectCall], Any]] | None] = ContextVar(
+    "fox_handlers", default=None
+)
 pure_functions: list[Contracted[Any, Any]] = []
 
 
-class Contracted(Protocol[P, R]):
+class Contracted(Protocol[P, R_co]):
     """A ``@fox`` function.
 
     ``__fox__`` is present when checks are compiled in. ``python -O`` returns
@@ -45,29 +52,51 @@ class Contracted(Protocol[P, R]):
 
     __fox__: Spec
     __name__: str
-    __wrapped__: Callable[P, R]
+    __wrapped__: Any
 
-    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R: ...
+    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R_co: ...
 
 
-def _call(
-    runner: Callable[P, R],
-    target: Callable[P, R],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-) -> R:
-    """Call the memoised function. Unhashable arguments skip the memo table."""
+class FoxDecorator(Protocol):
+    @overload
+    def __call__(
+        self, func: Callable[P, Generator[Any, Any, R_call]]
+    ) -> Contracted[P, R_call]: ...
 
-    if runner is target:
-        return target(*args, **kwargs)
+    @overload
+    def __call__(self, func: Callable[P, R_call]) -> Contracted[P, R_call]: ...
 
-    # functools.cache turns an unhashable argument into a TypeError that looks like a body bug.
+
+def _dispatch(request: EffectCall, *, checked: bool) -> Any:
+    if checked:
+        for active in _stack.get():
+            reject_unnamed(performed(active), {request.effect})
+        handler = (_handlers.get() or {}).get(request.effect)
+        if handler is not None:
+            return handler(request)
+    return request.function(*request.args, **request.kwargs)
+
+
+def _drive(value: Any, *, checked: bool) -> Any:
+    if not inspect.isgenerator(value):
+        return value
+
+    generator = value
     try:
-        hash((args, tuple(kwargs.items())))
-    except TypeError:
-        return target(*args, **kwargs)
-
-    return runner(*args, **kwargs)
+        request = next(generator)
+        while True:
+            if not isinstance(request, EffectCall):
+                raise TypeError("@fox generators must yield fox.perform(...) requests")
+            try:
+                result = _dispatch(request, checked=checked)
+            except BaseException as error:
+                request = generator.throw(error)
+            else:
+                request = generator.send(result)
+    except StopIteration as finished:
+        return finished.value
+    finally:
+        generator.close()
 
 
 def _checked(
@@ -79,25 +108,25 @@ def _checked(
     declared: frozenset[Effect],
 ) -> Contracted[P, R]:
     spec = Spec(predicates(requires), predicates(ensures), declared)
+    signature = inspect.signature(target)
     reject_unnamed(performed(spec), effects_used(target))
 
     @functools.wraps(target)
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
-        arguments = bind(target, args, kwargs)
-        check_requires(spec, arguments)
-
         parent = _stack.get()
         if parent:
             reject_unnamed(performed(parent[-1]), set(performed(spec)))
-
         token: Token[tuple[Spec, ...]] = _stack.set((*parent, spec))
         try:
-            result = _call(runner, target, args, kwargs)
+            bound = signature.bind(*args, **kwargs)
+            bound.apply_defaults()
+            arguments = bound.arguments
+            check_requires(spec, arguments)
+            result = runner(*args, **kwargs)
+            check_ensures(spec, arguments, result)
+            return result
         finally:
             _stack.reset(token)
-
-        check_ensures(spec, arguments, result)
-        return result
 
     contracted = cast(Contracted[P, R], wrapper)
     contracted.__fox__ = spec
@@ -115,13 +144,17 @@ class fox:
     the parameter names plus ``result``. ``effects`` names what the body may do.
     The default is ``pure``. Pass one predicate or a sequence of predicates.
 
-    A pure function is memoised in development and in the optimised build.
+    A pure, non-generator function is memoised in development and in the
+    optimised build. Generator functions are driven and never memoised.
     ``python -O`` drops ``requires``, ``ensures``, ``fox.claim``, and the effect
     check. The memo table stays.
 
     Register an effectful call with ``fox.track(print, log)``. Calling another
     ``@fox`` function performs the effects that function names.
     """
+
+    @overload
+    def __new__(cls, func: Callable[P, Generator[Any, Any, R]], /) -> Contracted[P, R]: ...
 
     @overload
     def __new__(cls, func: Callable[P, R], /) -> Contracted[P, R]: ...
@@ -135,7 +168,8 @@ class fox:
         requires: Predicate | Iterable[Predicate] | None = None,
         ensures: Predicate | Iterable[Predicate] | None = None,
         effects: EffectInput = PURE,
-    ) -> Callable[[Callable[P, R]], Contracted[P, R]]: ...
+        memoize: bool = True,
+    ) -> FoxDecorator: ...
 
     def __new__(
         cls,
@@ -145,14 +179,30 @@ class fox:
         requires: Predicate | Iterable[Predicate] | None = None,
         ensures: Predicate | Iterable[Predicate] | None = None,
         effects: EffectInput = PURE,
+        memoize: bool = True,
     ) -> Contracted[P, R] | Callable[[Callable[P, R]], Contracted[P, R]]:
         def decorate(target: Callable[P, R]) -> Contracted[P, R]:
             declared = effects_of(effects)
 
-            # Built outside the debug branch so python -O still memoises pure functions.
-            cached = functools.cache(target) if PURE in declared else target
-            runner = cast(Callable[P, R], cached)
+            if not callable(target):
+                raise TypeError("fox expects a callable")
+            call = getattr(target, "__call__", None)
+            if any(
+                inspect.iscoroutinefunction(item) or inspect.isasyncgenfunction(item)
+                for item in (target, call)
+            ):
+                raise TypeError("fox supports synchronous functions and generators, not async")
+            if not isinstance(memoize, bool):
+                raise TypeError("memoize must be a bool")
+            is_generator = inspect.isgeneratorfunction(target) or inspect.isgeneratorfunction(call)
+            if is_generator:
 
+                @functools.wraps(target)
+                def runner(*args: P.args, **kwargs: P.kwargs) -> R:
+                    return cast(R, _drive(target(*args, **kwargs), checked=__debug__))
+
+            else:
+                runner = memoized(target) if memoize and PURE in declared else target
             if __debug__:
                 return _checked(
                     target,
@@ -168,11 +218,11 @@ class fox:
         return decorate
 
     @staticmethod
-    def claim(condition: bool, message: str = "") -> None:
-        """Check a fact in the body. Compiled out under ``python -O``."""
+    def claim(condition: bool | Callable[[], bool], message: str = "") -> None:
+        """Check a fact. A lazy callable is not evaluated under ``python -O``."""
 
         if __debug__:
-            _claim(condition, message)
+            _claim(condition() if callable(condition) else condition, message)
 
     @staticmethod
     def track(func: Callable[..., Any], *effects: Effect | str) -> None:
@@ -181,12 +231,51 @@ class fox:
         if not effects:
             raise TypeError("fox.track expects at least one effect")
 
-        slot = tracked.setdefault(id(func), set())
+        try:
+            slot = tracked.setdefault(func, set())
+        except TypeError as error:
+            raise TypeError("fox.track requires a weak-referenceable callable") from error
         for item in effects:
             chosen = one_effect(item)
             if chosen == PURE:
                 raise ValueError("pure is not an effect a call performs")
             slot.add(chosen)
+
+    @staticmethod
+    def perform(
+        named_effect: Effect | str,
+        function: Callable[..., Any],
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> EffectCall:
+        """Yield an interceptable call from a generator decorated with ``@fox``."""
+
+        if not callable(function):
+            raise TypeError("fox.perform expects a callable")
+        return EffectCall(one_effect(named_effect), function, args, kwargs)
+
+    @staticmethod
+    @contextmanager
+    def intercept(
+        named_effect: Effect | str, handler: Callable[[EffectCall], Any]
+    ) -> Generator[None, None, None]:
+        """Handle one yielded effect in the current context; intended for tests."""
+
+        if not __debug__:
+            raise RuntimeError("fox effect interception is disabled under python -O")
+        if not callable(handler):
+            raise TypeError("fox.intercept expects a callable handler")
+        chosen = one_effect(named_effect)
+        if chosen == PURE:
+            raise ValueError("pure cannot be intercepted")
+        handlers = dict(_handlers.get() or {})
+        handlers[chosen] = handler
+        token = _handlers.set(handlers)
+        try:
+            yield
+        finally:
+            _handlers.reset(token)
 
     @staticmethod
     def between(low: float | None = None, high: float | None = None) -> Between:
@@ -209,6 +298,7 @@ def _claim(condition: bool, message: str) -> None:
 
 __all__ = [
     "Effect",
+    "EffectCall",
     "EffectError",
     "FailedClaim",
     "PostconditionError",
