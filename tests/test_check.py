@@ -6,9 +6,8 @@ import pytest
 from hypothesis import find, settings
 from hypothesis.errors import NoSuchExample, Unsatisfiable
 
-from fox import fox
+from fox import EffectError, effect, fox
 from fox.check import check, strategy_for
-from fox.effects import EffectCall
 from fox.runtime import _checking
 
 _FIND_SETTINGS = settings(database=None, max_examples=100)
@@ -67,63 +66,142 @@ def test_check_bypasses_memoization_during_generated_runs() -> None:
     assert _checking.get() is False
 
 
-def test_effectful_non_generator_is_rejected_even_with_handler() -> None:
+def test_missing_boundary_handler_prevents_real_io() -> None:
     body_calls: list[int] = []
-    handler_calls: list[EffectCall] = []
+
+    @effect("io")
+    def read(value: int) -> int:
+        body_calls.append(value)
+        return value
 
     @fox(effects="io")
     def target(value: int) -> int:
-        body_calls.append(value)
-        return value
+        return read(value)
 
-    with pytest.raises(TypeError, match=r"requires effectful function.*generator"):
-        check(target, handlers={"io": handler_calls.append})
-
-    assert body_calls == []
-    assert handler_calls == []
-
-
-def test_nested_effectful_non_generator_fails_closed_during_check() -> None:
-    body_calls: list[int] = []
-
-    @fox(effects="io")
-    def direct_io(value: int) -> int:
-        body_calls.append(value)
-        return value
-
-    @fox(effects="io")
-    def caller(value: int):
-        direct_io(value)
-        if False:
-            yield fox.perform("io", lambda: None)
-
-    with pytest.raises(TypeError, match="generated effectful calls must be generators"):
-        check(caller, handlers={"io": lambda request: None})
+    with pytest.raises(EffectError, match=r"handler.*read"):
+        check(target)
 
     assert body_calls == []
     assert _checking.get() is False
 
 
-def test_generator_effect_checks_keep_explicit_handlers_working() -> None:
-    requests: list[EffectCall] = []
+def test_nested_ordinary_calls_use_boundary_handlers() -> None:
+    body_calls: list[int] = []
+
+    @effect("io")
+    def read(value: int) -> int:
+        body_calls.append(value)
+        return value
 
     @fox(effects="io")
-    def target(value: Annotated[int, fox.between(3, 3)]):
-        result = yield fox.perform("io", lambda number: number + 1, value)
+    def inner(value: int) -> int:
+        return read(value)
+
+    @fox(effects="io", ensures=lambda result: result == 4)
+    def caller(value: int) -> int:
+        return inner(value)
+
+    with pytest.raises(EffectError, match="handler"):
+        check(caller)
+
+    check(caller, handlers={read: lambda value: 4})
+
+    assert body_calls == []
+    assert _checking.get() is False
+
+
+def test_handlers_receive_normal_positional_and_keyword_arguments() -> None:
+    calls: list[tuple[int, int]] = []
+
+    @effect("io")
+    def add(number: int, /, *, step: int) -> int:
+        raise AssertionError("real boundary executed")
+
+    @fox(effects="io")
+    def target(value: Annotated[int, fox.between(3, 3)]) -> None:
+        result = add(value, step=1)
         fox.claim(result == 4)
 
-    with pytest.raises(TypeError, match="needs handlers for declared effects: io"):
-        check(target)
-    assert requests == []
+    def handle(number: int, /, *, step: int) -> int:
+        calls.append((number, step))
+        return number + step
 
-    def handle(request: EffectCall) -> int:
-        requests.append(request)
-        return request.args[0] + 1
+    check(target, handlers={add: handle})
 
-    check(target, handlers={"io": handle})
+    assert calls
+    assert set(calls) == {(3, 1)}
 
-    assert requests
-    assert all(request.args == (3,) for request in requests)
+
+def test_boundaries_with_the_same_effect_need_their_own_handlers() -> None:
+    real_calls: list[str] = []
+
+    @effect("io")
+    def read() -> str:
+        real_calls.append("read")
+        return "real"
+
+    @effect("io")
+    def write(value: str) -> None:
+        real_calls.append("write")
+
+    @fox(effects="io")
+    def copy() -> None:
+        write(read())
+
+    with pytest.raises(EffectError, match=r"handler.*write"):
+        check(copy, handlers={read: lambda: "fake"})
+    assert real_calls == []
+
+    written: list[str] = []
+    check(copy, handlers={read: lambda: "fake", write: written.append})
+    assert written == ["fake"]
+    assert real_calls == []
+
+
+def test_unused_effect_declarations_do_not_need_handlers() -> None:
+    @fox(effects=("io", "db"), ensures=lambda value, result: value == result)
+    def no_io(value: int) -> int:
+        return value
+
+    check(no_io)
+
+
+def test_predicates_use_handlers_during_generated_checks() -> None:
+    @effect("io")
+    def valid(value: int) -> bool:
+        raise AssertionError("real boundary executed")
+
+    @fox(effects="io", requires=lambda value: valid(value))
+    def target(value: int) -> int:
+        return value
+
+    check(target, handlers={valid: lambda value: True})
+
+
+def test_filtering_does_not_bypass_predicate_effect_declarations() -> None:
+    @effect("io")
+    def valid(value: int) -> bool:
+        raise AssertionError("real boundary executed")
+
+    @fox(requires=lambda value: valid(value))
+    def target(value: int) -> int:
+        return value
+
+    with pytest.raises(EffectError, match="io"):
+        check(target, handlers={valid: lambda value: False})
+
+
+def test_check_does_not_leak_handlers_into_later_calls() -> None:
+    @effect("io")
+    def read() -> str:
+        return "real"
+
+    @fox(effects="io")
+    def target() -> str:
+        return read()
+
+    check(target, handlers={read: lambda: "fake"})
+    assert target() == "real"
 
 
 def test_unsatisfiable_precondition_error_includes_target_name_and_cause() -> None:
