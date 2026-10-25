@@ -1,11 +1,20 @@
 import subprocess
 import sys
-from typing import Annotated
+from collections.abc import Generator
+from typing import Annotated, Any
 
 import pytest
 from hypothesis import given
 
-from fox import EffectError, FailedClaim, PostconditionError, PreconditionError, effect, fox
+from fox import (
+    EffectCall,
+    EffectError,
+    FailedClaim,
+    PostconditionError,
+    PreconditionError,
+    effect,
+    fox,
+)
 from fox.check import check, strategy_for
 
 
@@ -135,6 +144,10 @@ def test_optimize_keeps_memo_and_drops_checks() -> None:
         "print(square(3))\n"
         "print(calls)\n"
         "print(hasattr(square, '__fox__'))\n"
+        "@fox\n"
+        "def total(values: list[int]) -> int:\n"
+        "    return sum(values)\n"
+        "print(total([1, 2]))\n"
     )
     result = subprocess.run(
         [sys.executable, "-O", "-c", script],
@@ -142,7 +155,7 @@ def test_optimize_keeps_memo_and_drops_checks() -> None:
         capture_output=True,
         text=True,
     )
-    assert result.stdout.splitlines() == ["1", "9", "9", "2", "False"]
+    assert result.stdout.splitlines() == ["1", "9", "9", "2", "False", "3"]
 
 
 def test_between_is_the_users_bound() -> None:
@@ -162,3 +175,65 @@ def test_spec_is_stored() -> None:
 
     assert shown.__fox__.pure is False
     assert len(shown.__fox__.requires) == 1
+
+
+def test_generator_effect_is_intercepted() -> None:
+    seen: list[tuple[str, tuple[object, ...]]] = []
+
+    @fox(effects="io")
+    def load(path: str) -> Generator[EffectCall, Any, str]:
+        value = yield fox.perform("io", open, path)
+        return value
+
+    def fake_io(request: EffectCall) -> str:
+        seen.append((request.effect.name, request.args))
+        return "stubbed"
+
+    with fox.intercept("io", fake_io):
+        result: str = load("notes.txt")
+        assert result == "stubbed"
+    assert seen == [("io", ("notes.txt",))]
+
+
+def test_check_requires_handlers_for_effectful_generators() -> None:
+    from fox.check import check
+
+    @fox(effects="io")
+    def load(path: str) -> Generator[EffectCall, Any, str]:
+        return (yield fox.perform("io", open, path))
+
+    with pytest.raises(TypeError, match="handlers"):
+        check(load)
+
+    seen: list[str] = []
+
+    def fake_io(request: EffectCall) -> str:
+        seen.append(request.args[0])
+        return "stubbed"
+
+    check(load, handlers={"io": fake_io})
+    assert seen
+
+
+def test_generator_effects_execute_in_optimized_mode() -> None:
+    script = (
+        "from fox import fox\n"
+        "@fox(effects='io')\n"
+        "def load():\n"
+        "    result = yield fox.perform('io', lambda: 'ok')\n"
+        "    return result\n"
+        "print(load())\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-O", "-c", script], check=True, capture_output=True, text=True
+    )
+    assert result.stdout.strip() == "ok"
+
+
+def test_generator_cannot_yield_an_undeclared_effect() -> None:
+    @fox(effects="db")
+    def wrong_effect() -> Generator[EffectCall, Any, None]:
+        yield fox.perform("io", lambda: None)
+
+    with pytest.raises(EffectError, match="io"):
+        wrong_effect()
