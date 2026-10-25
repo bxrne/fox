@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -27,6 +29,16 @@ def effect(name: str) -> Effect:
     """
 
     return Effect(name)
+
+
+@dataclass(frozen=True)
+class EffectCall:
+    """A request yielded by a ``@fox`` generator for the runtime to handle."""
+
+    effect: Effect
+    function: Callable[..., Any]
+    args: tuple[Any, ...]
+    kwargs: dict[str, Any]
 
 
 class Between:
