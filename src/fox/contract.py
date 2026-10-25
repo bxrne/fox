@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from typing import Any, Union, cast
 
 from typing_extensions import Protocol
@@ -13,9 +14,7 @@ from fox.errors import PostconditionError, PreconditionError
 
 
 class Predicate(Protocol):
-    """A named callable that returns a bool."""
-
-    __name__: str
+    """A callable that returns a bool."""
 
     def __call__(self, *args: Any, **kwargs: Any) -> bool: ...
 
@@ -23,22 +22,13 @@ class Predicate(Protocol):
 EffectInput = Union[Effect, str, Iterable[Union[Effect, str]]]
 
 
+@dataclass(frozen=True)
 class Spec:
     """The boundary stored on ``function.__fox__`` while checks are compiled in."""
 
     requires: tuple[Predicate, ...]
     ensures: tuple[Predicate, ...]
     effects: frozenset[Effect]
-
-    def __init__(
-        self,
-        requires: tuple[Predicate, ...],
-        ensures: tuple[Predicate, ...],
-        effects: frozenset[Effect],
-    ) -> None:
-        self.requires = requires
-        self.ensures = ensures
-        self.effects = effects
 
     @property
     def pure(self) -> bool:
@@ -53,8 +43,10 @@ def predicates(value: Predicate | Iterable[Predicate] | None) -> tuple[Predicate
     if value is None:
         return ()
 
-    if not isinstance(value, Iterable):
+    if callable(value):
         return (cast(Predicate, value),)
+    if not isinstance(value, Iterable):
+        raise TypeError("requires and ensures must be callables")
 
     found = tuple(value)
     for predicate in found:
@@ -102,52 +94,41 @@ def performed(spec: Spec) -> frozenset[Effect]:
     return spec.effects
 
 
-def bind(func: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Name every argument, including defaults, so predicates can use keywords."""
-
-    signature = inspect.signature(func)
-    bound = signature.bind(*args, **kwargs)
-    bound.apply_defaults()
-    return dict(bound.arguments)
+def predicate_name(predicate: Predicate) -> str:
+    return getattr(predicate, "__name__", type(predicate).__name__)
 
 
 def call_predicate(predicate: Predicate, arguments: Mapping[str, Any]) -> bool:
-    """Call a predicate with the parameter names it declares.
-
-    ``ensures`` may also take ``result``. A non-bool return is a programmer error.
-    """
+    """Project named arguments onto a predicate's Python calling convention."""
 
     signature = inspect.signature(predicate)
-    parameters = signature.parameters.values()
-    accepts_any = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters)
-
-    if accepts_any:
-        payload = dict(arguments)
-    else:
-        payload = {name: arguments[name] for name in signature.parameters if name in arguments}
-        missing = [
-            name
-            for name, parameter in signature.parameters.items()
-            if parameter.kind
-            in (
-                inspect.Parameter.POSITIONAL_ONLY,
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                inspect.Parameter.KEYWORD_ONLY,
-            )
-            and parameter.default is inspect.Parameter.empty
-            and name not in payload
-        ]
-        if missing:
-            names = ", ".join(missing)
-            message = f"predicate {predicate.__name__} expects {names}"
-            message = f"{message}, which this function does not provide"
-            raise TypeError(message)
-
-    outcome: Any = predicate(**payload)
+    values: dict[str, Any] = {}
+    extras = dict(arguments)
+    missing: list[str] = []
+    variadic = None
+    for name, parameter in signature.parameters.items():
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            variadic = name
+        elif name in arguments:
+            values[name] = extras.pop(name)
+        elif parameter.default is inspect.Parameter.empty and parameter.kind is not (
+            inspect.Parameter.VAR_POSITIONAL
+        ):
+            missing.append(name)
+    if missing:
+        names = ", ".join(missing)
+        raise TypeError(
+            f"predicate {predicate_name(predicate)} expects {names}, "
+            "which this function does not provide"
+        )
+    if variadic is not None:
+        values[variadic] = extras
+    bound = inspect.BoundArguments(signature, values)
+    bound.apply_defaults()
+    outcome: Any = predicate(*bound.args, **bound.kwargs)
     if not isinstance(outcome, bool):
         found = type(outcome).__name__
-        raise TypeError(f"predicate {predicate.__name__} returned {found}, expected bool")
-
+        raise TypeError(f"predicate {predicate_name(predicate)} returned {found}, expected bool")
     return outcome
 
 
@@ -156,7 +137,7 @@ def check_requires(spec: Spec, arguments: Mapping[str, Any]) -> None:
 
     for predicate in spec.requires:
         if not call_predicate(predicate, arguments):
-            raise PreconditionError(f"requires failed for {predicate.__name__}")
+            raise PreconditionError(f"requires failed for {predicate_name(predicate)}")
 
 
 def check_ensures(spec: Spec, arguments: Mapping[str, Any], result: Any) -> None:
@@ -167,4 +148,4 @@ def check_ensures(spec: Spec, arguments: Mapping[str, Any], result: Any) -> None
 
     for predicate in spec.ensures:
         if not call_predicate(predicate, payload):
-            raise PostconditionError(f"ensures failed for {predicate.__name__}")
+            raise PostconditionError(f"ensures failed for {predicate_name(predicate)}")
