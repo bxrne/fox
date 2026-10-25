@@ -1,6 +1,6 @@
 """Integer square root. The contract is the test.
 
-    uv run python -m fox examples/isqrt.py
+uv run python -m fox examples/isqrt.py
 """
 
 from typing import Annotated

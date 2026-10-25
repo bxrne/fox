@@ -1,7 +1,7 @@
 """A notes API. The pure rule is checked by fox. The route only does HTTP.
 
-    uv run --group examples python -m fox examples/notes.py
-    uv run --group examples python examples/notes.py
+uv run --group examples python -m fox examples/notes.py
+uv run --group examples python examples/notes.py
 """
 
 from __future__ import annotations
