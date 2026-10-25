@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import inspect
 import types
+from contextlib import ExitStack
+from collections.abc import Mapping
 from typing import Annotated, Any, Callable, Union, cast, get_args, get_origin, get_type_hints
 
 from hypothesis import HealthCheck, assume, given, settings
@@ -12,7 +14,7 @@ from typing_extensions import ParamSpec
 
 from fox import Contracted, Spec, pure_functions
 from fox.contract import call_predicate
-from fox.effects import Between
+from fox.effects import Between, Effect, EffectCall
 
 P = ParamSpec("P")
 _UNIONS = (Union, getattr(types, "UnionType", Union))
@@ -57,15 +59,26 @@ def strategy_for(annotation: Any) -> st.SearchStrategy[Any]:
     raise TypeError(f"fox has no generator for {annotation!r}")
 
 
-def check(func: Contracted[P, Any]) -> None:
+def check(
+    func: Contracted[P, Any],
+    *,
+    handlers: Mapping[Effect | str, Callable[[EffectCall], Any]] | None = None,
+) -> None:
     """Draw arguments from the annotations and call ``func``.
 
     Draws that fail ``requires`` are discarded. ``ensures`` and ``fox.claim``
-    inside the call are the test. The function must be pure and fully annotated.
+    inside the call are the test. Effectful functions need a handler for each
+    declared effect, so generated calls never perform real I/O by accident.
     """
 
     signature = inspect.signature(func)
     spec: Spec = func.__fox__
+
+    supplied = {key if isinstance(key, Effect) else Effect(key) for key in (handlers or {})}
+    missing = spec.effects - supplied
+    if not spec.pure and missing:
+        names = ", ".join(sorted(item.name for item in missing))
+        raise TypeError(f"fox.check needs handlers for declared effects: {names}")
 
     # Hints live on the user's function. The wrapper's globals cannot see fox.between.
     original = getattr(func, "__wrapped__", func)
@@ -98,7 +111,10 @@ def check(func: Contracted[P, Any]) -> None:
 
         cast(Callable[..., Any], func)(**arguments)
 
-    run()
+    with ExitStack() as stack:
+        for named_effect, handler in (handlers or {}).items():
+            stack.enter_context(fox.intercept(named_effect, handler))
+        run()
 
 
 def check_pure() -> int:
