@@ -18,4 +18,4 @@ class FailedClaim(ContractError):
 
 
 class EffectError(ContractError):
-    """A call performs an effect the current function did not name."""
+    """An effect is undeclared, or a generated call has no boundary handler."""
